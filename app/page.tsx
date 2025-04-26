@@ -39,7 +39,7 @@ export default function Home() {
 
           {/* Right side: Scale visualization */}
           <div className="space-y-6">
-            <div className="bg-gray-800 p-6 rounded-lg shadow-sm h-[600px] flex items-center justify-center bg-black/50 backdrop-blur-lg shadow-xl">
+            <div className="p-6 rounded-lg h-[600px] flex items-center justify-center bg-black/50 backdrop-blur-lg shadow-xl">
               <ScaleVisualization />
             </div>
           </div>
