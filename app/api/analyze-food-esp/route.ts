@@ -1,0 +1,110 @@
+import { type NextRequest, NextResponse } from "next/server"
+import { GoogleGenAI } from "@google/genai"
+import { database, ref, set } from "@/lib/firebase"
+
+// Initialize the Google Generative AI client
+const genAI = new GoogleGenAI({ apiKey: process.env.GOOGLE_API_KEY! })
+
+export async function POST(req: NextRequest) {
+  // Check content type
+  const contentType = req.headers.get('content-type');
+  if (contentType !== 'image/jpeg') {
+    return NextResponse.json({ error: 'Only image/jpeg is accepted' }, { status: 415 });
+  }
+
+  try {
+    // Read the request body as an array buffer
+    const arrayBuffer = await req.arrayBuffer();
+    
+    // Convert array buffer to base64
+    const buffer = Buffer.from(arrayBuffer);
+    const base64Image = buffer.toString('base64');
+
+    // Define the prompt for nutrition analysis
+    const prompt = 'Analyze this food image and provide its nutritional facts using this json format "{ \\"food\\": \\"Red Apple\\", \\"nutritional_facts_per_gram\\": { \\"calories\\": 0.475, \\"carbohydrates\\": { \\"total\\": 0.125, \\"sugars\\": 0.095, \\"dietary_fiber\\": 0.02 }, \\"protein\\": 0.0025, \\"fat\\": 0.0015, \\"vitamin_c\\": \\"0.07% RDI\\", \\"potassium_mg\\": 0.975, \\"water_content\\": \\"85%\\" } }" if no object reply with none.';
+
+    // Prepare contents for Gemini API
+    const contents = [
+      {
+        inlineData: {
+          mimeType: 'image/jpeg',
+          data: base64Image,
+        },
+      },
+      { text: prompt },
+    ];
+
+    // Generate content using Gemini API
+    const response = await genAI.models.generateContent({
+      model: "gemini-2.0-flash-lite",
+      contents: contents,
+    });
+
+    const text = response.text
+    console.log(text)
+
+
+    // Try to parse the response as JSON
+    try {
+      // Extract JSON from the response if it's wrapped in text or code blocks
+      const jsonMatch = text?.match(/\{[\s\S]*\}/)
+      const jsonString = jsonMatch ? jsonMatch[0] : text
+      const nutritionData = JSON.parse(jsonString)
+
+      // return NextResponse.json(nutritionData)
+
+      // Add timestamp to the data
+      const dataWithTimestamp = {
+        ...nutritionData,
+        timestamp: Date.now(),
+      }
+
+      // Store the data in Firebase
+      await set(ref(database, "food"), dataWithTimestamp)
+      try {
+        const caption = (`Gemini:\n${text}` as string) || ""
+    
+        // Get environment variables
+        const botToken = process.env.TELEGRAM_BOT_TOKEN
+        const chatId = process.env.TELEGRAM_CHAT_ID
+    
+        if (!botToken || !chatId) {
+          return NextResponse.json({ success: false, error: "Missing bot token or chat ID" }, { status: 500 })
+        }
+    
+        // Create a new FormData instance for the Telegram API request
+        const telegramFormData = new FormData()
+        telegramFormData.append("chat_id", chatId)
+    
+        if (caption) {
+          telegramFormData.append("caption", caption)
+        }
+    
+        const photoBlob = new Blob([buffer], { type: 'image/jpeg' });
+        telegramFormData.append("photo", photoBlob, 'food_image.jpg');
+    
+        // Send the photo to Telegram
+        const response = await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
+          method: "POST",
+          body: telegramFormData,
+        })
+    
+        const result = await response.json()
+    
+        if (!result.ok) {
+          return NextResponse.json({ success: false, error: result.description || "Failed to send photo" }, { status: 500 })
+        }
+      } catch (error) {
+        console.error("Error sending photo to Telegram:", error)
+      }
+
+      return NextResponse.json(dataWithTimestamp)
+    } catch (error) {
+      // If parsing fails, return the raw text
+      return NextResponse.json({ raw: text, error: "Failed to parse JSON response" })
+    }
+  } catch (error) {
+    console.error("Error processing image:", error)
+    return NextResponse.json({ error: "Failed to process image" }, { status: 500 })
+  }
+}
