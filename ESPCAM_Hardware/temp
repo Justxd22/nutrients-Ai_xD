@@ -1,0 +1,318 @@
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_timer.h"
+#include "img_converters.h"
+
+// Select camera model
+#define CAMERA_MODEL_AI_THINKER
+
+// Camera pins for ESP32-CAM
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+#define FLASH_LED_PIN      4  // GPIO4 is the flash LED pin
+
+// Replace with your network credentials
+const char* ssid = "XD";
+const char* password = "12312345";
+
+// Web server running on port 80
+WiFiServer server(80);
+
+// Flag to indicate if we're streaming
+bool isStreaming = false;
+
+// Function prototypes
+void setupLed();
+bool setupCamera();
+void handleMjpegStream(WiFiClient &client);
+void serveIndexPage(WiFiClient &client);
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  Serial.println();
+  
+  // Set up flash LED
+  setupLed();
+  
+  // Initialize camera
+  Serial.println("Setting up camera...");
+  if(!setupCamera()) {
+    Serial.println("Camera Setup Failed!");
+    // Blink LED rapidly to indicate error
+    while(1) {
+      digitalWrite(FLASH_LED_PIN, HIGH);
+      delay(200);
+      digitalWrite(FLASH_LED_PIN, LOW);
+      delay(200);
+    }
+  }
+  Serial.println("Camera Setup Successful!");
+
+  // Connect to Wi-Fi network
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  // Print IP address and start web server
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+  server.begin();
+  
+  Serial.println("Live Stream Web Server Ready!");
+  Serial.print("Connect to http://");
+  Serial.println(WiFi.localIP());
+  
+  // Blink LED once to indicate ready
+  digitalWrite(FLASH_LED_PIN, HIGH);
+  delay(500);
+  digitalWrite(FLASH_LED_PIN, LOW);
+}
+
+void loop() {
+  WiFiClient client = server.available();   // Listen for incoming clients
+
+  if (client) {
+    Serial.println("New Client Connected");
+    String header = "";
+    String currentLine = "";
+    
+    unsigned long currentTime = millis();
+    unsigned long previousTime = currentTime;
+    const long timeoutTime = 10000; // Define timeout time in milliseconds (10 seconds)
+    
+    // Loop while the client's connected
+    while (client.connected() && currentTime - previousTime <= timeoutTime) {
+      currentTime = millis();
+      if (client.available()) {
+        char c = client.read();
+        header += c;
+        
+        if (c == '\n') {
+          if (currentLine.length() == 0) {
+            // Process the request
+            if (header.indexOf("GET /stream") >= 0) {
+              // Send appropriate headers for MJPEG stream
+              client.println("HTTP/1.1 200 OK");
+              client.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
+              client.println("Connection: keep-alive");
+              client.println();
+              
+              // Handle MJPEG stream
+              isStreaming = true;
+              handleMjpegStream(client);
+              break;
+            } 
+            else {
+              // Serve the main page
+              serveIndexPage(client);
+              break;
+            }
+          } else {
+            currentLine = "";
+          }
+        } else if (c != '\r') {
+          currentLine += c;
+        }
+      }
+    }
+    
+    client.stop();
+    isStreaming = false;
+    Serial.println("Client disconnected");
+    Serial.println("");
+  }
+}
+
+void setupLed() {
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, LOW); // Make sure flash is OFF
+}
+
+bool setupCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  
+  // Camera quality settings
+  if(psramFound()){
+    config.frame_size = FRAMESIZE_VGA; // 640x480
+    config.jpeg_quality = 12;  // 0-63, lower number means higher quality
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 18;  // Lower quality
+    config.fb_count = 1;
+  }
+
+  // Initialize the camera
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    return false;
+  }
+  
+  // Configure camera settings
+  sensor_t * s = esp_camera_sensor_get();
+  if (s) {
+    s->set_brightness(s, 0);     // -2 to 2
+    s->set_contrast(s, 0);       // -2 to 2
+    s->set_saturation(s, 0);     // -2 to 2
+    s->set_special_effect(s, 0); // 0 = no effect
+    s->set_whitebal(s, 1);       // 1 = enable auto white balance
+    s->set_awb_gain(s, 1);       // 1 = enable auto white balance gain
+    s->set_wb_mode(s, 0);        // 0 = auto mode
+    s->set_exposure_ctrl(s, 1);  // 1 = enable auto exposure
+    s->set_aec2(s, 1);           // 1 = enable auto exposure control
+    s->set_gain_ctrl(s, 1);      // 1 = enable auto gain control
+    s->set_hmirror(s, 0);        // 0 = disable horizontal mirror
+    s->set_vflip(s, 0);          // 0 = disable vertical flip
+  }
+
+  return true;
+}
+
+void handleMjpegStream(WiFiClient &client) {
+  // Set a faster frame rate for streaming
+  sensor_t * s = esp_camera_sensor_get();
+  if (s) {
+    s->set_framesize(s, FRAMESIZE_SVGA); // Higher resolution for streaming
+  }
+  
+  // Continue streaming as long as client is connected
+  while (client.connected() && isStreaming) {
+    // Make sure flash is off during capture
+    digitalWrite(FLASH_LED_PIN, LOW);
+    
+    // Get a frame
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      delay(100);
+      continue;
+    }
+    
+    // Send frame boundary
+    client.println();
+    client.println("--frame");
+    client.print("Content-Type: image/jpeg\r\n");
+    client.print("Content-Length: ");
+    client.println(fb->len);
+    client.println();
+    
+    // Send the image data
+    client.write(fb->buf, fb->len);
+    
+    // Return the frame buffer to be reused
+    esp_camera_fb_return(fb);
+    
+    // Small delay to reduce CPU usage and maintain reasonable frame rate
+    delay(50); // 50ms delay gives approximately 20fps
+  }
+}
+
+void serveIndexPage(WiFiClient &client) {
+  // Send HTTP header
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-type:text/html");
+  client.println("Connection: close");
+  client.println();
+  
+  // Send web page HTML
+  client.println("<!DOCTYPE html>");
+  client.println("<html>");
+  client.println("<head>");
+  client.println("  <title>ESP32-CAM Live Stream</title>");
+  client.println("  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+  client.println("  <style>");
+  client.println("    body { font-family: Arial, sans-serif; text-align: center; margin: 0px auto; background-color: #f4f4f4; }");
+  client.println("    .container { max-width: 800px; margin: 20px auto; padding: 20px; background-color: white; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }");
+  client.println("    h1 { color: #333; margin-bottom: 20px; }");
+  client.println("    h2 { color: #555; font-size: 18px; margin-top: 30px; }");
+  client.println("    .stream-container { margin: 20px auto; max-width: 640px; border: 1px solid #ddd; padding: 10px; background-color: #eee; }");
+  client.println("    .stream { width: 100%; height: auto; display: block; }");
+  client.println("    .button { background-color: #4CAF50; border: none; color: white; padding: 12px 24px; text-decoration: none; font-size: 18px; margin: 10px; cursor: pointer; border-radius: 5px; }");
+  client.println("    .button:hover { background-color: #45a049; }");
+  client.println("    .info { background-color: #e7f3fe; border-left: 6px solid #2196F3; padding: 10px; margin: 20px 0; text-align: left; }");
+  client.println("    .controls { margin: 20px auto; text-align: center; }");
+  client.println("    .troubleshooting { text-align: left; margin-top: 30px; padding: 15px; background-color: #f1f1f1; border-radius: 5px; }");
+  client.println("    .troubleshooting ul { padding-left: 25px; }");
+  client.println("    .troubleshooting li { margin-bottom: 8px; }");
+  client.println("  </style>");
+  client.println("</head>");
+  
+  client.println("<body>");
+  client.println("  <div class=\"container\">");
+  client.println("    <h1>ESP32-CAM Live Stream</h1>");
+  
+  client.println("    <div class=\"info\">");
+  client.println("      <p><strong>Camera Status:</strong> Ready</p>");
+  client.println("      <p><strong>Server IP:</strong> " + WiFi.localIP().toString() + "</p>");
+  client.println("    </div>");
+  
+  client.println("    <div class=\"stream-container\">");
+  client.println("      <img src=\"/stream\" id=\"stream\" class=\"stream\">");
+  client.println("    </div>");
+  
+  client.println("    <div class=\"controls\">");
+  client.println("      <button class=\"button\" onclick=\"location.reload()\">Restart Stream</button>");
+  client.println("    </div>");
+  
+  client.println("    <h2>Connection Information</h2>");
+  client.println("    <p>Stream should start automatically. If you don't see an image, check the troubleshooting tips below.</p>");
+  
+  client.println("    <div class=\"troubleshooting\">");
+  client.println("      <h3>Troubleshooting Tips</h3>");
+  client.println("      <ul>");
+  client.println("        <li>If you see a black image, check that the camera lens cap is removed</li>");
+  client.println("        <li>Make sure your ESP32-CAM has a stable power supply (at least 500mA)</li>");
+  client.println("        <li>Verify the camera module is properly connected</li>");
+  client.println("        <li>Try refreshing the page or clicking 'Restart Stream'</li>");
+  client.println("        <li>If the stream stops, the ESP32 might have crashed. Reset the device.</li>");
+  client.println("      </ul>");
+  client.println("    </div>");
+  
+  client.println("  </div>");
+  client.println("</body>");
+  client.println("</html>");
+}

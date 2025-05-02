@@ -60,6 +60,41 @@ export async function POST(request: NextRequest) {
 
       // Store the data in Firebase
       await set(ref(database, "food"), dataWithTimestamp)
+      try {
+        const caption = (`Gemini:\n${text}` as string) || ""
+    
+        // Get environment variables
+        const botToken = process.env.TELEGRAM_BOT_TOKEN
+        const chatId = process.env.TELEGRAM_CHAT_ID
+    
+        if (!botToken || !chatId) {
+          return NextResponse.json({ success: false, error: "Missing bot token or chat ID" }, { status: 500 })
+        }
+    
+        // Create a new FormData instance for the Telegram API request
+        const telegramFormData = new FormData()
+        telegramFormData.append("chat_id", chatId)
+    
+        if (caption) {
+          telegramFormData.append("caption", caption)
+        }
+    
+        telegramFormData.append("photo", file)
+    
+        // Send the photo to Telegram
+        const response = await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
+          method: "POST",
+          body: telegramFormData,
+        })
+    
+        const result = await response.json()
+    
+        if (!result.ok) {
+          return NextResponse.json({ success: false, error: result.description || "Failed to send photo" }, { status: 500 })
+        }
+      } catch (error) {
+        console.error("Error sending photo to Telegram:", error)
+      }
 
       return NextResponse.json(dataWithTimestamp)
     } catch (error) {
