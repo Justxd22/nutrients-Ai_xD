@@ -5,6 +5,9 @@
 #include "esp_camera.h"
 #include <HTTPClient.h>
 #include "esp_heap_caps.h"
+#include <HX711.h>              // Add HX711 library
+#include <LiquidCrystal_I2C.h>  // Add LCD library
+#include <Wire.h>               // Add Wire library for I2C communication
 
 // WiFi credentials
 #define WIFI_SSID "XD"
@@ -28,12 +31,26 @@ AsyncClient aClient(ssl_client, getNetwork(network));
 RealtimeDatabase Database;
 AsyncResult aResult_no_callback;
 
-// Button configuration
-#define BUTTON_PIN 12      // Digital pin for button input
-#define DEBOUNCE_TIME 50   // Debounce time in milliseconds
-#define WEIGHT_INCREMENT 50.0 // Weight increment per button press (in grams)
-#define CELL_DT 2
-#define CELL_SCK 14
+// HX711 configuration
+#define LOADCELL_DOUT_PIN 2     // HX711 data pin
+#define LOADCELL_SCK_PIN  14    // HX711 clock pin
+HX711 scale;                    // Create HX711 instance
+
+// LCD configuration (I2C)
+#define LCD_ADDRESS 0x27        // I2C address for LCD (default for most I2C LCDs)
+#define LCD_COLUMNS 16          // Number of columns on LCD
+#define LCD_ROWS    2           // Number of rows on LCD
+LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
+
+// Calibration factor for your specific load cell (you'll need to calibrate)
+#define CALIBRATION_FACTOR -215.0  // Example value, replace with your calibrated value
+
+// Weight recording threshold and timing
+#define WEIGHT_THRESHOLD 20.0   // Minimum weight change to trigger update (in grams)
+#define DEBOUNCE_TIME 1000      // Minimum time between weight updates (in milliseconds)
+#define FIREBASE_UPDATE_INTERVAL 5000  // Update Firebase every 5 seconds
+#define LCD_SDA 13
+#define LCD_SCL 15
 
 // Camera pins for ESP32-CAM AI-THINKER
 #define PWDN_GPIO_NUM     32
@@ -60,12 +77,16 @@ void printError(int code, const String &msg);
 bool initCamera();
 bool captureAndUploadPhoto();
 void printMemoryInfo();
+void setupI2C();
+void initLoadCell();
+float getWeight();
+void updateLCD(float weight);
 
-// Button state variables
-bool lastButtonState = HIGH;  // Assuming pull-up resistor (button pressed = LOW)
-unsigned long lastDebounceTime = 0;
+// Weight tracking variables
 float currentWeight = 0.0;
-bool buttonPressed = false;
+float lastRecordedWeight = 0.0;
+unsigned long lastWeightUpdateTime = 0;
+unsigned long lastFirebaseUpdateTime = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -73,6 +94,16 @@ void setup() {
   
   // Print initial memory status
   printMemoryInfo();
+  
+  // Set up I2C for LCD (using software I2C on available pins)
+  setupI2C();
+  
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
   
   // Connect to Wi-Fi
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -85,24 +116,43 @@ void setup() {
   Serial.print("Connected with IP: ");
   Serial.println(WiFi.localIP());
   
-  // Initialize camera first to allocate memory for it
+  lcd.clear();
+  lcd.print("WiFi Connected");
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.localIP());
+  delay(2000);
+  
+  // Initialize camera
+  lcd.clear();
+  lcd.print("Init Camera...");
   if (!initCamera()) {
     Serial.println("Camera initialization failed");
+    lcd.setCursor(0, 1);
+    lcd.print("Camera Failed!");
   } else {
     Serial.println("Camera initialization successful");
+    lcd.setCursor(0, 1);
+    lcd.print("Camera Ready!");
   }
+  delay(1000);
   
   // Print memory status after camera init
   printMemoryInfo();
   
-  // Set up button pin with internal pull-up resistor
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  // Initialize load cell
+  lcd.clear();
+  lcd.print("Init Scale...");
+  initLoadCell();
+  lcd.setCursor(0, 1);
+  lcd.print("Scale Ready!");
+  delay(1000);
   
   // Configure client to use less memory for SSL
   ssl_client.setInsecure(); // Use if you don't need certificate verification
-  // ssl_client.setBufferSizes(4096, 1024); // Reduce buffer sizes (rx, tx)
   
   // Initialize Firebase app
+  lcd.clear();
+  lcd.print("Init Firebase...");
   Serial.printf("Firebase Client v%s\n", FIREBASE_CLIENT_VERSION);
   initializeApp(aClient, app, getAuth(user_auth), aResult_no_callback);
   
@@ -115,8 +165,16 @@ void setup() {
   aClient.setAsyncResult(aResult_no_callback);
   
   Serial.println("Setup completed");
+  lcd.setCursor(0, 1);
+  lcd.print("Setup Complete!");
+  delay(1000);
   
   // Initialize weight in Firebase
+  lcd.clear();
+  lcd.print("Ready to weigh");
+  lcd.setCursor(0, 1);
+  lcd.print("Place item...");
+  
   bool status = Database.set<float>(aClient, "/scale/weight", currentWeight);
   if (status) {
     Serial.print("Initial weight set: ");
@@ -131,65 +189,112 @@ void setup() {
 }
 
 void loop() {
-  // Release and acquire resources as needed
-  static unsigned long lastFirebaseUpdate = 0;
-  const unsigned long firebaseInterval = 5000; // Update Firebase every 5 seconds
-  
-  // Only perform Firebase operations periodically to save resources
-  if (millis() - lastFirebaseUpdate >= firebaseInterval) {
+  // Handle Firebase authentication and database operations periodically
+  if (millis() - lastFirebaseUpdateTime >= FIREBASE_UPDATE_INTERVAL) {
     authHandler();
     Database.loop();
-    lastFirebaseUpdate = millis();
+    lastFirebaseUpdateTime = millis();
   }
   
-  // Read button state with debounce
-  int reading = digitalRead(BUTTON_PIN);
+  // Get current weight from load cell
+  float newWeight = getWeight();
   
-  // Check if button state changed
-  if (reading != lastButtonState) {
-    lastDebounceTime = millis();
-  }
+  // Update LCD with current weight
+  updateLCD(newWeight);
   
-  // If button state has been stable for debounce period
-  if ((millis() - lastDebounceTime) > DEBOUNCE_TIME) {
-    // If button is pressed (LOW with pull-up resistor) and was not pressed before
-    if (reading == LOW && !buttonPressed) {
-      buttonPressed = true;
+  // Check if weight has changed significantly
+  if (abs(newWeight - lastRecordedWeight) > WEIGHT_THRESHOLD && 
+      millis() - lastWeightUpdateTime > DEBOUNCE_TIME) {
+    
+    // Update the current weight
+    currentWeight = newWeight;
+    lastRecordedWeight = newWeight;
+    lastWeightUpdateTime = millis();
+    
+    // Print available memory before Firebase operation
+    printMemoryInfo();
+    
+    // Update weight in Firebase Realtime Database
+    bool status = Database.set<float>(aClient, "/scale/weight", currentWeight);
+    if (status) {
+      Serial.print("Weight updated: ");
+      Serial.print(currentWeight);
+      Serial.println(" grams");
       
-      // Increment weight
-      currentWeight += WEIGHT_INCREMENT;
+      // Take a photo when weight changes significantly
+      Serial.println("Weight changed. Taking photo...");
+      lcd.clear();
+      lcd.print("Taking photo...");
       
-      // Print available memory before Firebase operation
-      printMemoryInfo();
-      
-      // Update weight in Firebase Realtime Database
-      bool status = Database.set<float>(aClient, "/scale/weight", currentWeight);
-      if (status) {
-        Serial.print("Weight updated: ");
-        Serial.print(currentWeight);
-        Serial.println(" grams");
-        
-        // Take a photo when weight changes
-        Serial.println("Weight changed. Taking photo...");
-        if (captureAndUploadPhoto()) {
-          Serial.println("Photo taken and uploaded successfully");
-        } else {
-          Serial.println("Failed to capture or upload photo");
-        }
+      if (captureAndUploadPhoto()) {
+        Serial.println("Photo taken and uploaded successfully");
+        lcd.setCursor(0, 1);
+        lcd.print("Photo uploaded!");
       } else {
-        printError(aClient.lastError().code(), aClient.lastError().message());
+        Serial.println("Failed to capture or upload photo");
+        lcd.setCursor(0, 1);
+        lcd.print("Photo failed!");
       }
-    } 
-    // Button is released
-    else if (reading == HIGH && buttonPressed) {
-      buttonPressed = false;
+      
+      // Return to weight display after a short delay
+      delay(1500);
+    } else {
+      printError(aClient.lastError().code(), aClient.lastError().message());
     }
   }
   
-  // Save the button state for the next loop
-  lastButtonState = reading;
+  delay(100); // Short delay for stability
+}
+
+// Set up I2C communication for LCD
+void setupI2C() {
+  // Using GPIO 15 (SCL) and GPIO 13 (SDA) for I2C
+  // These pins are typically available on ESP32-CAM
+  Wire.begin(LCD_SDA, LCD_SCL);  // SDA, SCL
+}
+
+// Initialize HX711 load cell
+void initLoadCell() {
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  delay(1000); // Give it time to stabilize
   
-  delay(10); // Short delay for stability
+  Serial.println("Initializing the scale");
+  scale.set_scale(CALIBRATION_FACTOR);  // Set calibration factor
+  
+  // Tare the scale (set zero point)
+  Serial.println("Tare... remove any weights from the scale");
+  delay(2000);
+  scale.tare();
+  Serial.println("Tare complete");
+}
+
+// Get weight from load cell
+float getWeight() {
+  if (scale.is_ready()) {
+    float weight = scale.get_units(5);  // Average 5 readings for stability
+    if (weight < 0) {
+      weight = 0.0;  // Don't allow negative weights
+    }
+    return weight;
+  } else {
+    Serial.println("HX711 not found");
+    return -1.0;  // Error indicator
+  }
+}
+
+// Update LCD with weight information
+void updateLCD(float weight) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Weight:");
+  lcd.setCursor(0, 1);
+  
+  if (weight < 0) {
+    lcd.print("Error reading");
+  } else {
+    lcd.print(weight, 1);  // Display with 1 decimal place
+    lcd.print(" g");
+  }
 }
 
 // Print memory information
@@ -252,12 +357,12 @@ void flushOldFrames() {
   }
 }
 
-
+// Capture photo and upload to server with memory management
 bool captureAndUploadPhoto() {
   // Free up any resources before taking photo
   printMemoryInfo();
 
-  flushOldFrames(); // <-- Add this to force a fresh capture
+  flushOldFrames(); // Force a fresh capture
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
