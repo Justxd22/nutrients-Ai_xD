@@ -4,3 +4,6 @@
 - Ai Food/Nutrients recoginzation 
 - RTDB sync across App instances
 - Tailwind + Nextjs
+
+
+# Docs comming soon (I'm doing finals rn)
